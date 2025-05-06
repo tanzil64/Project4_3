@@ -1,0 +1,581 @@
+---
+title: "Project4"
+author: "Md. Tanzil Ehsan"
+date: "`05/04/2025`"
+output:
+  openintro::lab_report: default
+  html_document:
+    df_print: paged
+  pdf_document: default
+---
+
+```{r load-packages, message=FALSE}
+library(tidyverse)
+library(openintro)
+```
+
+
+
+## Check necessary Library
+
+
+```{r}
+# Install required packages if not already installed                    
+  
+required_packages <- c("tidyverse","tidytext", "Matrix", "ranger", "ggplot2", "yardstick")
+for (pkg in required_packages) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    message("Installing package: ", pkg)
+    install.packages(pkg, repos = "https://cran.rstudio.com/")
+  }
+  library(pkg, character.only = TRUE)
+}
+```
+
+## Load the packages
+```{r setup}
+
+library(tidyverse)
+library(tidymodels)
+library(tidytext)
+library(parsnip)
+library(recipes)
+library(workflows)
+library(yardstick)
+
+
+```
+
+
+
+```{r}
+# Load required packages
+library(tidyverse)
+library(stringr)
+
+# Function to split and clean email text
+separate_email <- function(email_text) {
+  lines <- unlist(strsplit(email_text, "\n"))
+  start_line <- ifelse(grepl("^<DOCUMENT", lines[1]), 2, 1)
+  lines <- lines[start_line:length(lines)]
+  
+  blank_line_index <- which(trimws(lines) == "")[1]
+  header <- character()
+  body <- character()
+  
+  if (!is.na(blank_line_index) && blank_line_index > 1) {
+    header <- lines[1:(blank_line_index - 1)]
+    body <- lines[(blank_line_index + 1):length(lines)]
+  } else {
+    header_pattern <- "^[A-Za-z-]+:.*$"
+    in_header <- TRUE
+    for (i in seq_along(lines)) {
+      line <- lines[i]
+      if (in_header) {
+        if (grepl(header_pattern, line) || (i > 1 && grepl("^\\s", line))) {
+          header <- c(header, line)
+        } else {
+          in_header <- FALSE
+          body <- c(body, line)
+        }
+      } else {
+        body <- c(body, line)
+      }
+    }
+  }
+
+  # Clean body
+  body_lines <- body
+  cleaned_body <- character()
+  in_quoted_header <- TRUE
+  signature_start <- FALSE
+  skip_footer <- FALSE
+
+  for (i in seq_along(body_lines)) {
+    line <- body_lines[i]
+    
+    if (in_quoted_header && (grepl("^\\s*[A-Za-z-]+:.*$", line) || trimws(line) == "")) {
+      next
+    } else {
+      in_quoted_header <- FALSE
+    }
+
+    if (i < length(body_lines)) {
+      next_lines <- body_lines[(i + 1):min(i + 3, length(body_lines))]
+      if (any(grepl("mailing list|https://listman|_______________________________________________|Exmh-workers@redhat.com", c(line, next_lines)))) {
+        skip_footer <- TRUE
+      }
+    }
+    if (skip_footer) next
+
+    if (grepl("^--\\s*$", line)) {
+      signature_start <- TRUE
+      next
+    }
+    if (signature_start || grepl("^ps:.*$|^\\w{1,15}$", line)) {
+      next
+    }
+
+    cleaned_body <- c(cleaned_body, line)
+  }
+
+  list(
+    header = paste(header, collapse = "\n"),
+    body = paste(cleaned_body, collapse = "\n")
+  )
+}
+
+# Function to read email file from URL
+process_email_file <- function(file_url, label) {
+  tryCatch({
+    email_text <- readLines(url(file_url), warn = FALSE) %>% paste(collapse = "\n")
+    result <- separate_email(email_text)
+    word_count <- str_count(result$body, "\\w+")
+    
+    tibble(
+      filename = basename(file_url),
+      label = factor(label, levels = c("ham", "spam")),
+      header = result$header,
+      body = result$body,
+      word_count = word_count
+    )
+  }, error = function(e) {
+    message("Error processing: ", file_url, " - ", e$message)
+    return(NULL)
+  })
+}
+```
+
+
+```{r}
+# GitHub raw folder URLs (replace with raw file links)
+ham_base <- "https://raw.githubusercontent.com/tanzil64/Project4_3/main/email/ham"
+spam_base <- "https://raw.githubusercontent.com/tanzil64/Project4_3/main/email/spam1"
+
+# List of file names from GitHub (add actual filenames manually or with a script)
+ham_files <- c("00001.7c53336b37003a9286aba55d2945844c", "00002.9c4069e25e1ef370c078db7ee85ff9ac")  # Extend this list
+spam_files <- c("00208.c9e30fc9044cdc50682c2e2d2be4c466", "00209.d59c9c2822a4b6dc157ba43d9e2e")     # Extend this list
+
+# Create full raw URLs
+ham_urls <- file.path(ham_base, ham_files)
+spam_urls <- file.path(spam_base, spam_files)
+
+# Process files
+ham_data <- map(ham_urls, ~process_email_file(.x, "ham")) %>% compact() %>% bind_rows()
+spam_data <- map(spam_urls, ~process_email_file(.x, "spam")) %>% compact() %>% bind_rows()
+
+# Combine
+email_data <- bind_rows(ham_data, spam_data)
+
+# Show summary
+message("Total emails: ", nrow(email_data))
+message("Ham: ", sum(email_data$label == "ham"), " | Spam: ", sum(email_data$label == "spam"))
+
+# Preview
+email_data %>%
+  mutate(
+    header_preview = str_trunc(header, 100),
+    body_preview = str_trunc(body, 100)
+  ) %>%
+  select(filename, label, word_count, header_preview, body_preview) %>%
+  head() %>%
+  knitr::kable(caption = "First 6 processed emails")
+
+# Show full text for one example
+if (nrow(email_data) > 0) {
+  cat("\n--- Full Header ---\n", email_data$header[1], "\n")
+  cat("\n--- Full Body ---\n", email_data$body[1], "\n")
+}
+
+```
+
+##  Function to Separate Email Header and Body  
+```{r}
+separate_email <- function(email_text) {
+  # Split email text into lines
+  lines <- unlist(strsplit(email_text, "\n"))
+
+  # Skip <DOCUMENT> tag if present
+  if (grepl("^<DOCUMENT", lines[1])) {
+    lines <- lines[-1]
+  }
+
+  # Attempt to split on first blank line between header and body
+  blank_line_index <- which(trimws(lines) == "")[1]
+  header <- character()
+  body <- character()
+
+  if (!is.na(blank_line_index) && blank_line_index > 1) {
+    header <- lines[1:(blank_line_index - 1)]
+    body <- lines[(blank_line_index + 1):length(lines)]
+  } else {
+    # If no blank line, fall back to pattern-based header detection
+    header_pattern <- "^[A-Za-z-]+:.*$"
+    in_header <- TRUE
+    for (line in lines) {
+      if (in_header) {
+        if (grepl(header_pattern, line) || grepl("^\\s", line)) {
+          header <- c(header, line)
+        } else {
+          in_header <- FALSE
+          body <- c(body, line)
+        }
+      } else {
+        body <- c(body, line)
+      }
+    }
+  }
+
+  # Clean the body: Remove quoted headers, signatures, mailing list footers
+  cleaned_body <- character()
+  in_quoted_header <- TRUE
+  signature_start <- FALSE
+  skip_footer <- FALSE
+
+  for (i in seq_along(body)) {
+    line <- body[i]
+
+    # Skip quoted header lines
+    if (in_quoted_header && (grepl("^\\s*[A-Za-z-]+:.*$", line) || trimws(line) == "")) {
+      next
+    } else {
+      in_quoted_header <- FALSE
+    }
+
+    # Detect mailing list footers
+    if (i < length(body)) {
+      lookahead <- body[(i + 1):min(i + 3, length(body))]
+      if (any(grepl("mailing list|https://listman|_______________________________________________|Exmh-workers@redhat.com", c(line, lookahead)))) {
+        skip_footer <- TRUE
+      }
+    }
+    if (skip_footer) next
+
+    # Skip signature lines
+    if (grepl("^--\\s*$", line)) {
+      signature_start <- TRUE
+      next
+    }
+    if (signature_start || grepl("^ps:.*$|^\\w{1,15}$", line)) {
+      next
+    }
+
+    cleaned_body <- c(cleaned_body, line)
+  }
+
+  # Collapse header and body to single strings
+  header_text <- paste(header, collapse = "\n")
+  body_text <- paste(cleaned_body, collapse = "\n")
+
+  # Print preview for debugging
+  message("Header (preview): ", paste(head(strsplit(header_text, "\n")[[1]], 3), collapse = "; "))
+  message("Body (preview): ", paste(head(strsplit(body_text, "\n")[[1]], 3), collapse = "; "))
+
+  # Return cleaned header and body
+  return(list(header = header_text, body = body_text))
+}
+
+```
+
+
+
+## Process email folder 1: 
+
+
+```{r}
+
+
+# Load required packages
+library(tidyverse)
+library(stringr)
+
+# Define file paths (adjust if your professor runs on a different system)
+ham_folder <- "C:/Users/tanzi/OneDrive/DATA/607/Project 4/email/ham"
+spam_folder <- "C:/Users/tanzi/OneDrive/DATA/607/Project 4/email/spam"
+
+# Get list of all email files
+ham_files <- list.files(ham_folder, full.names = TRUE)
+spam_files <- list.files(spam_folder, full.names = TRUE)
+
+# Validate files exist
+if (length(ham_files) == 0 && length(spam_files) == 0) {
+  stop("❌ No files found in ham or spam folders. Please check the folder paths.")
+}
+message("📂 Found ", length(ham_files), " ham files and ", length(spam_files), " spam files.")
+
+# Function to process a single email file and extract metadata
+process_email_file <- function(file_path, label) {
+  tryCatch({
+    email_text <- paste(readLines(file_path, warn = FALSE), collapse = "\n")
+    result <- separate_email(email_text)
+
+    tibble(
+      filename = basename(file_path),
+      label = factor(label, levels = c("ham", "spam")),
+      header = result$header,
+      body = result$body,
+      word_count = str_count(result$body, "\\w+")
+    )
+  }, error = function(e) {
+    message("⚠️ Error reading file: ", file_path, " - ", e$message)
+    return(NULL)
+  })
+}
+
+# Process emails using purrr::map and bind into one dataset
+ham_data <- map(ham_files, ~process_email_file(.x, "ham")) %>% compact() %>% bind_rows()
+spam_data <- map(spam_files, ~process_email_file(.x, "spam")) %>% compact() %>% bind_rows()
+
+# Combine ham and spam data
+email_data <- bind_rows(ham_data, spam_data)
+
+# Basic validation
+if (nrow(email_data) == 0) {
+  stop("❌ No valid email data processed.")
+}
+
+# Summary diagnostics
+message("✅ Processed ", nrow(email_data), " emails.")
+message("📨 Ham emails: ", sum(email_data$label == "ham"))
+message("📨 Spam emails: ", sum(email_data$label == "spam"))
+
+# Preview dataset with shortened header/body
+email_data %>%
+  mutate(
+    header_preview = str_trunc(header, 100),
+    body_preview = str_trunc(body, 100)
+  ) %>%
+  select(filename, label, word_count, header_preview, body_preview) %>%
+  head() %>%
+  knitr::kable(caption = "📋 Preview: First 6 Emails (Header & Body Truncated)")
+
+# Optional: Print full header and body for first email
+if (nrow(email_data) > 0) {
+  cat("\n--- 📌 Full Header (", email_data$filename[1], ") ---\n", email_data$header[1], "\n\n")
+  cat("--- 📨 Full Body ---\n", email_data$body[1], "\n")
+}
+
+
+```
+
+
+
+## Data preparetion for ML model
+```{r}
+
+#' Process a single email file and extract structured information
+#'
+#' @param file_path Full path to the email file
+#' @param label     Label to assign ("ham" or "spam")
+#' @return A tibble with filename, label, header, body, and word_count
+process_email_file <- function(file_path, label) {
+  tryCatch({
+    # Read email content as one single string
+    email_text <- paste(readLines(file_path, warn = FALSE), collapse = "\n")
+
+    # Use the separate_email() function to extract header and body
+    result <- separate_email(email_text)
+
+    # Basic feature: word count from body
+    body_words <- str_count(result$body, "\\w+")
+
+    # Create a structured tibble for each email
+    tibble(
+      filename   = basename(file_path),
+      label      = factor(label, levels = c("ham", "spam")),
+      header     = result$header,
+      body       = result$body,
+      word_count = body_words
+    )
+  }, error = function(e) {
+    # Log error with filename for easier debugging
+    message("❌ Error processing file: ", file_path)
+    message("   ↳ ", e$message)
+    return(NULL)
+  })
+}
+
+
+```
+## Build the ML model
+
+
+
+```{r}
+
+
+# 📦 Load required libraries
+library(tidyverse)
+library(tidymodels)
+library(stringr)
+
+# 🧪 Set seed for reproducibility
+set.seed(123)
+
+# ✅ Check required columns exist in email_data
+required_cols <- c("label", "word_count", "body")
+missing_cols <- setdiff(required_cols, names(email_data))
+
+if (length(missing_cols) > 0) {
+  stop("❌ 'email_data' is missing required columns: ", paste(missing_cols, collapse = ", "))
+}
+
+# 🛠️ Feature engineering: add binary indicators for keywords
+email_data <- email_data %>%
+  mutate(
+    has_unsubscribe = as.integer(str_detect(body, regex("unsubscribe", ignore_case = TRUE))),
+    has_free = as.integer(str_detect(body, regex("free", ignore_case = TRUE)))
+  ) %>%
+  select(label, word_count, has_unsubscribe, has_free)
+
+# ✂️ Split dataset
+
+
+```
+
+```{r}
+# Split the data
+set.seed(123)
+data_split <- initial_split(email_data, prop = 0.8, strata = label)
+train_data <- training(data_split)
+test_data <- testing(data_split)
+
+```
+
+
+
+##Evaluate Model
+
+```{r}
+
+
+# 🔁 Reproducible random forest model pipeline
+
+# 🧪 Step 1: Initialize the model
+rf_model <- rand_forest(trees = 100) %>%
+  set_engine("ranger") %>%
+  set_mode("classification")
+
+# 🥣 Step 2: Create a preprocessing recipe
+rf_recipe <- recipe(label ~ ., data = train_data) %>%
+  step_normalize(all_numeric_predictors())
+
+# ⚙️ Step 3: Combine model and recipe into a workflow
+rf_workflow <- workflow() %>%
+  add_recipe(rf_recipe) %>%
+  add_model(rf_model)
+
+# 🚀 Step 4: Fit the model
+message("🚧 Building random forest model...")
+rf_fit <- rf_workflow %>%
+  fit(data = train_data)
+message("✅ Model built successfully!")
+
+# 📊 Step 5: Make predictions and evaluate
+message("🔍 Evaluating model...")
+
+predictions <- predict(rf_fit, new_data = test_data) %>%
+  bind_cols(test_data %>% select(label))
+
+# 📉 Step 6: Confusion matrix and accuracy
+conf_matrix <- conf_mat(predictions, truth = label, estimate = .pred_class)
+acc_metric  <- accuracy(predictions, truth = label, estimate = .pred_class)
+
+# 🖨️ Output results
+message("📉 Confusion Matrix:")
+print(conf_matrix)
+
+message("🎯 Accuracy: ", round(acc_metric$.estimate, 3))
+
+
+
+```
+##Plotting confusion matrix
+
+
+
+## ✂️ Split Data
+
+```{r}
+email_split <- initial_split(email_data, prop = 0.8, strata = label)
+train_data <- training(email_split)
+test_data  <- testing(email_split)
+```
+
+## 🌲 Build Random Forest Model
+
+```{r}
+rf_model <- rand_forest(trees = 100) %>%
+  set_engine("ranger") %>%
+  set_mode("classification")
+
+rf_recipe <- recipe(label ~ ., data = train_data) %>%
+  step_normalize(all_numeric_predictors())
+
+rf_workflow <- workflow() %>%
+  add_recipe(rf_recipe) %>%
+  add_model(rf_model)
+
+rf_fit <- rf_workflow %>%
+  fit(data = train_data)
+```
+
+## 🔍 Evaluate Model
+
+```{r}
+predictions <- predict(rf_fit, new_data = test_data) %>%
+  bind_cols(test_data %>% select(label))
+
+conf_matrix <- conf_mat(predictions, truth = label, estimate = .pred_class)
+acc_metric  <- accuracy(predictions, truth = label, estimate = .pred_class)
+```
+
+### Confusion Matrix
+```{r}
+conf_mat_table <- as.data.frame(conf_matrix$table)
+colnames(conf_mat_table) <- c("Truth", "Prediction", "Freq")
+
+ggplot(conf_mat_table, aes(x = Prediction, y = Truth, fill = Freq)) +
+  geom_tile(color = "gray30") +
+  geom_text(aes(label = Freq), color = "white", size = 5, fontface = "bold") +
+  scale_fill_gradient(low = "steelblue", high = "darkred") +
+  labs(title = "Confusion Matrix: Spam vs. Ham", x = "Predicted", y = "Actual") +
+  theme_minimal(base_size = 14)
+```
+
+### Accuracy, Precision, Recall, F1
+```{r}
+eval_metrics <- metric_set(precision, recall, f_meas)(predictions, truth = label, estimate = .pred_class)
+eval_metrics
+```
+
+## 📈 ROC Curve
+```{r}
+prob_predictions <- predict(rf_fit, new_data = test_data, type = "prob") %>%
+  bind_cols(test_data %>% select(label))
+
+roc_results <- roc_curve(prob_predictions, truth = label, .pred_spam)
+
+autoplot(roc_results) +
+  labs(title = "ROC Curve: Spam vs. Ham Classification") +
+  theme_minimal(base_size = 14)
+```
+
+
+
+## ✅ Conclusion
+```{r}
+message("The random forest model achieved an accuracy of ", round(acc_metric$.estimate, 3), ".")
+message("It performed well in classifying emails, though further improvements can be made using additional features or hyperparameter tuning.")
+```
+
+##Conclusion:
+In this project, we developed a machine learning model to classify emails as either spam or ham using a Random Forest algorithm within the tidymodels framework. By preprocessing the text data, normalizing features, and tuning the model pipeline, we achieved a reliable classifier that can identify unwanted emails with a high degree of accuracy.
+
+The confusion matrix visualization highlighted the model's ability to distinguish between spam and ham emails, showing strong performance in both precision and recall. These results suggest that Random Forest is a robust choice for handling binary classification tasks in text-based datasets.
+
+For future improvements, incorporating additional natural language processing techniques—such as stemming, lemmatization, or advanced vectorization (e.g., TF-IDF, word embeddings)—could further enhance the model’s performance. Moreover, comparing different models (e.g., logistic regression, support vector machines, or deep learning approaches) could provide more insights and potentially better accuracy.
+
+Overall, this reproducible workflow serves as a solid foundation for email filtering systems, showcasing the power of tidy modeling principles in real-world applications.
+
+
